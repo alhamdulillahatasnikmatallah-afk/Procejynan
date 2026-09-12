@@ -1,0 +1,147 @@
+name: Android Build (Nanzz Musify dari ZIP)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          set -e
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "Tidak ada file .zip di root repo"
+            ls -la
+            exit 1
+          fi
+          echo "Extract: $ZIP"
+          mkdir -p project
+          unzip -q "$ZIP" -d project
+          if [ ! -f project/settings.gradle.kts ] && [ ! -f project/gradlew ]; then
+            INNER=$(find project -maxdepth 3 -name settings.gradle.kts 2>/dev/null | head -n 1 | xargs -r dirname)
+            if [ -n "$INNER" ] && [ "$INNER" != "project" ]; then
+              echo "Inner project dir: $INNER"
+              shopt -s dotglob
+              mv "$INNER"/* project/ 2>/dev/null || true
+            fi
+          fi
+          ls -la project
+          test -f project/settings.gradle.kts
+          test -f project/gradlew
+
+      - name: Ensure Gradle Wrapper JAR
+        working-directory: project
+        run: |
+          set -e
+          mkdir -p gradle/wrapper
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar hilang — download..."
+            curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \
+              "https://github.com/gradle/gradle/raw/v9.6.1/gradle/wrapper/gradle-wrapper.jar" || \
+            curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \
+              "https://github.com/gradle/gradle/raw/v8.11.1/gradle/wrapper/gradle-wrapper.jar"
+          fi
+          ls -la gradle/wrapper/
+          chmod +x gradlew
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" || \
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" || \
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build Debug APK
+        id: build
+        working-directory: project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug --console=plain --stacktrace --info --warning-mode all --no-daemon 2>&1 | tee ../build-debug.log
+
+      - name: Show FULL error report (jelas)
+        if: always()
+        run: |
+          echo "=============================================="
+          echo " 1) KOTLIN ERRORS (baris e:)"
+          echo "=============================================="
+          grep -n '^e: ' build-debug.log | head -n 200 || echo "(tidak ada baris e:)"
+
+          echo ""
+          echo "=============================================="
+          echo " 2) UNRESOLVED / COMPILE ERRORS"
+          echo "=============================================="
+          grep -nEi 'Unresolved reference|cannot find symbol|None of the following|Type mismatch|Overload resolution|Expecting|Syntax error|e: file://' build-debug.log | head -n 200 || echo "(tidak ada)"
+
+          echo ""
+          echo "=============================================="
+          echo " 3) WHAT WENT WRONG / FAILURE"
+          echo "=============================================="
+          grep -nEi 'FAILURE:|What went wrong:|Execution failed|BUILD FAILED|error:' build-debug.log | head -n 80 || echo "(tidak ada)"
+
+          echo ""
+          echo "=============================================="
+          echo " 4) WARNINGS"
+          echo "=============================================="
+          grep -nEi 'warning:|deprecated|^w: ' build-debug.log | head -n 100 || echo "(tidak ada)"
+
+          echo ""
+          echo "=============================================="
+          echo " 5) 150 BARIS TERAKHIR LOG"
+          echo "=============================================="
+          tail -n 150 build-debug.log || true
+
+          echo ""
+          echo "=============================================="
+          echo " 6) KONTEKS SEKITAR ERROR"
+          echo "=============================================="
+          grep -n '^e: ' build-debug.log | head -n 15 | while IFS=: read -r lineno rest; do
+            start=$((lineno > 40 ? lineno - 40 : 1))
+            end=$((lineno + 5))
+            echo "----- sekitar baris $lineno -----"
+            sed -n "\( {start}, \){end}p" build-debug.log || true
+            echo ""
+          done
+
+      - name: Upload Debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanzz-musify-debug-apk
+          path: project/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Build Log (full)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanzz-musify-debug-log
+          path: build-debug.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail job if build failed
+        if: steps.build.outcome != 'success'
+        run: |
+          echo "Build gagal. Lihat step Show FULL error report atau artifact nanzz-musify-debug-log"
+          exit 1
